@@ -53,7 +53,6 @@ def get_cmap(name):
         ]
     return LinearSegmentedColormap.from_list(name.lower(), colors)
 
-# Предопределенный WGS84 WKT для быстрого доступа
 WGS84_WKT = """
 GEOGCS["WGS 84",
     DATUM["WGS_1984",
@@ -156,7 +155,7 @@ def create_colored_geotiff(data, src_profile, crs, transform, cmap_name, index_n
         'photometric': 'rgb'
     }
     
-    # Просто проверяем, что crs не None
+    #Проверяем, что crs не None
     if crs is not None:
         try:
             profile['crs'] = crs
@@ -186,7 +185,6 @@ async def calculate_ndvi(
     target_epsg: int = 4326
 ):
     try:
-        # Чтение и проверка файлов
         red_content, red_profile, red_shape = (await read_and_validate_files(red_file))[0]
         nir_content, nir_profile, nir_shape = (await read_and_validate_files(nir_file))[0]
         
@@ -312,7 +310,6 @@ async def calculate_cvi(
 ):
     """Расчет CVI (Chlorophyll Vegetation Index)"""
     try:
-        # Чтение и проверка файлов
         green_content, green_profile, green_shape = (await read_and_validate_files(green_file))[0]
         red_content, red_profile, red_shape = (await read_and_validate_files(red_file))[0]
         nir_content, nir_profile, nir_shape = (await read_and_validate_files(nir_file))[0]
@@ -342,7 +339,6 @@ async def calculate_cvi(
                 red, _, _, _ = reproject_with_transform(red_src, red, target_crs)
                 nir, _, _, _ = reproject_with_transform(nir_src, nir, target_crs)
 
-                # Расчет CVI с обработкой деления на ноль
                 green_squared = green ** 2
                 # Заменяем нули на NaN, чтобы избежать деления на ноль
                 green_squared[green_squared == 0] = np.nan
@@ -351,10 +347,9 @@ async def calculate_cvi(
                 with np.errstate(divide='ignore', invalid='ignore'):
                     cvi = (nir * red) / green_squared
                 
-                # Заменяем бесконечности и NaN на 0
                 cvi = np.nan_to_num(cvi, nan=0.0, posinf=0.0, neginf=0.0)
                 
-                # Автоматическое определение диапазона (игнорируем выбросы)
+                # Автоматическое определение диапазона
                 valid_values = cvi[np.isfinite(cvi)]
                 if len(valid_values) > 0:
                     cvi_min = np.percentile(valid_values, 2)  # 2-й перцентиль
@@ -370,7 +365,6 @@ async def calculate_cvi(
                     cvi_normalized = np.zeros_like(cvi)
                 cvi_normalized = np.clip(cvi_normalized, 0, 1)
 
-                # Создание результата
                 output_bytes = create_colored_geotiff(
                     cvi_normalized,
                     green_src.profile,
@@ -399,7 +393,6 @@ async def calculate_cvi(
     
 async def shutdown_event():
     print("Shutting down...")
-    # Здесь можно добавить очистку ресурсов, если нужно
 
 app.add_event_handler("shutdown", shutdown_event)
 
