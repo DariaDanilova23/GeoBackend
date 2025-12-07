@@ -8,18 +8,20 @@ from rasterio.crs import CRS
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from rasterio.enums import ColorInterp
 import io
-import traceback
 import os
 from matplotlib.colors import LinearSegmentedColormap
 from functools import lru_cache
 import logging
+import tempfile
+import uvicorn
+import asyncio
+from typing import List, Dict, Any
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 if 'PROJ_LIB' in os.environ:
-    del os.environ['PROJ_LIB']  # Удаляем проблемную переменную
+    del os.environ['PROJ_LIB']  
 
 app = FastAPI()
 
@@ -31,7 +33,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Кэшируем создание цветовых карт, так как они неизменны
+# Кэширование создания цветовых карт, т.к. они неизменны
 @lru_cache(maxsize=3)
 def get_cmap(name):
     if name == 'NDVI':
@@ -65,8 +67,8 @@ GEOGCS["WGS 84",
         AUTHORITY["EPSG","9122"]],
     AUTHORITY["EPSG","4326"]]
 """
+
 def safe_crs_from_epsg(epsg_code):
-    """Безопасное создание CRS с обработкой ошибок PROJ"""
     try:
         return CRS.from_epsg(epsg_code)
     except Exception as e:
@@ -78,323 +80,490 @@ def safe_crs_from_epsg(epsg_code):
             raise ValueError("Не удалось создать CRS")
 
 def strict_crs_validation(src, default_epsg=4326):
-    """Проверка CRS без использования is_valid"""
     if src.crs is None:
         return safe_crs_from_epsg(default_epsg)
     
     try:
         crs = CRS.from_user_input(src.crs)
-        # Вместо is_valid просто проверяем, что CRS создан без ошибок
         return crs
     except Exception:
         return safe_crs_from_epsg(default_epsg)
 
-def reproject_with_transform(src, data, target_crs):
-    """Оптимизированная репроекция"""
-    try:
-        transform, width, height = calculate_default_transform(
-            src.crs, target_crs, src.width, src.height, *src.bounds)
-        
-        destination = np.empty((height, width), dtype=data.dtype)
-        
-        reproject(
-            source=data,
-            destination=destination,
-            src_transform=src.transform,
-            src_crs=src.crs,
-            dst_transform=transform,
-            dst_crs=target_crs,
-            resampling=Resampling.bilinear
+async def save_uploaded_file_to_temp(file: UploadFile, max_size_mb: int = 200) -> str:
+    """Сохраняет загруженный файл во временный файл с потоковой записью"""
+    # Проверяем размер файла
+    file.file.seek(0, 2)  # Переход в конец
+    file_size = file.file.tell()
+    file.file.seek(0)  # Возврат в начало
+    
+    if file_size > max_size_mb * 1024 * 1024:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Файл {file.filename} превышает максимальный размер {max_size_mb}MB"
         )
+    
+    # Создаем временный файл
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.tif')
+    temp_path = temp_file.name
+    temp_file.close()
+    
+    try:
+        # Потоковая запись файла
+        with open(temp_path, 'wb') as f:
+            while True:
+                chunk = await file.read(1024 * 1024)  # Читаем по 1MB
+                if not chunk:
+                    break
+                f.write(chunk)
         
-        return destination, transform, width, height
+        # Валидация файла
+        with rasterio.open(temp_path) as src:
+            if src.count < 1:
+                raise ValueError(f"Файл {file.filename} не содержит данных")
+            
+            return temp_path
+                
     except Exception as e:
-        logger.warning(f"Reprojection failed, using original: {str(e)}")
-        return data, src.transform, src.width, src.height
+        # Очистка в случае ошибки
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Ошибка обработки файла {file.filename}: {str(e)}"
+        )
 
-async def read_and_validate_files(*files):
-    """Чтение и валидация файлов"""
+async def read_and_validate_files(*files) -> List[Dict[str, Any]]:
+    """Читает и валидирует файлы с сохранением во временные файлы"""
     file_data = []
-    for file in files:
-        content = await file.read()
-        try:
-            with MemoryFile(content) as memfile:
-                with memfile.open() as src:
-                    if src.count < 1:
-                        raise ValueError(f"Файл {file.filename} не содержит данных")
-                    file_data.append((content, src.profile, src.shape))
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Ошибка обработки файла {file.filename}: {str(e)}"
-            )
-    return file_data
+    temp_files = []
+    
+    try:
+        for file in files:
+            # Сохраняем файл на диск
+            temp_path = await save_uploaded_file_to_temp(file)
+            temp_files.append(temp_path)
+            
+            # Читаем метаданные
+            with rasterio.open(temp_path) as src:
+                file_data.append({
+                    'path': temp_path,
+                    'profile': src.profile,
+                    'shape': src.shape,
+                    'crs': src.crs,
+                    'transform': src.transform,
+                    'dtype': src.dtypes[0],
+                    'count': src.count
+                })
+        
+        return file_data
+        
+    except Exception as e:
+        # Очистка временных файлов в случае ошибки
+        for temp_path in temp_files:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        raise
 
-def create_colored_geotiff(data, src_profile, crs, transform, cmap_name, index_name):
-    """Создание GeoTIFF без использования is_valid"""
+def calculate_ndvi_chunked(red_path: str, nir_path: str) -> str:
+    """Вычисление NDVI по кускам"""
+    temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.tif')
+    output_path = temp_output.name
+    temp_output.close()
+    
+    try:
+        with rasterio.open(red_path) as red_src, \
+             rasterio.open(nir_path) as nir_src:
+       
+            profile = red_src.profile.copy()
+            
+            profile.update({
+                'dtype': 'float32',
+                'count': 1,
+                'driver': 'GTiff',
+                'tiled': True,
+                'blockxsize': 256,
+                'blockysize': 256,
+                'compress': 'lzw'
+            })
+            
+            if 'nodata' in profile:
+                del profile['nodata']
+            
+            with rasterio.open(output_path, 'w', **profile) as dst:
+                #Обрабатываем по блокам
+                for _, window in red_src.block_windows(1):
+                    #Читение только текущего блок
+                    red_chunk = red_src.read(1, window=window).astype('float32')
+                    nir_chunk = nir_src.read(1, window=window).astype('float32')
+                    
+                    #Вычисление NDVI для блока
+                    denominator = nir_chunk + red_chunk
+                    mask = denominator != 0
+                    
+                    ndvi_chunk = np.zeros_like(red_chunk, dtype='float32')
+                    
+                    if np.any(mask):
+                        ndvi_chunk[mask] = (nir_chunk[mask] - red_chunk[mask]) / denominator[mask]
+
+                    ndvi_chunk = np.clip(ndvi_chunk, -1, 1)
+                    
+                    #Для невалидных пикселей 0
+                    ndvi_chunk[~mask] = 0
+                    
+                    dst.write(ndvi_chunk, 1, window=window)
+            
+            return output_path
+            
+    except Exception as e:
+        if os.path.exists(output_path):
+            os.unlink(output_path)
+        raise
+
+def calculate_evi_chunked(blue_path: str, red_path: str, nir_path: str, 
+                         L: float = 1.0, C1: float = 6.0, C2: float = 7.5, G: float = 2.5) -> str:
+    """Вычисление EVI по кускам"""
+    temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.tif')
+    output_path = temp_output.name
+    temp_output.close()
+    
+    try:
+        with rasterio.open(blue_path) as blue_src, \
+             rasterio.open(red_path) as red_src, \
+             rasterio.open(nir_path) as nir_src:
+            
+            profile = blue_src.profile.copy()
+            profile.update({
+                'dtype': 'float32',
+                'count': 1,
+                'driver': 'GTiff',
+                'tiled': True,
+                'blockxsize': 256,
+                'blockysize': 256,
+                'compress': 'lzw'
+            })
+            
+            if 'nodata' in profile:
+                del profile['nodata']
+            
+            with rasterio.open(output_path, 'w', **profile) as dst:
+                for _, window in blue_src.block_windows(1):
+                    blue_chunk = blue_src.read(1, window=window).astype('float32')
+                    red_chunk = red_src.read(1, window=window).astype('float32')
+                    nir_chunk = nir_src.read(1, window=window).astype('float32')
+                    
+                    #Вычисление EVI
+                    numerator = nir_chunk - red_chunk
+                    denominator = nir_chunk + C1 * red_chunk - C2 * blue_chunk + L
+                    
+                    mask = denominator != 0
+                    evi_chunk = np.zeros_like(blue_chunk, dtype='float32')
+                    
+                    if np.any(mask):
+                        evi_chunk[mask] = G * (numerator[mask] / denominator[mask])
+                    
+                    evi_chunk = np.clip(evi_chunk, 0, 1)
+                    evi_chunk[~mask] = 0
+                    
+                    dst.write(evi_chunk, 1, window=window)
+            
+            return output_path
+            
+    except Exception as e:
+        if os.path.exists(output_path):
+            os.unlink(output_path)
+        raise
+
+def calculate_cvi_chunked(green_path: str, red_path: str, nir_path: str) -> str:
+    """Вычисление CVI по кускам"""
+    temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.tif')
+    output_path = temp_output.name
+    temp_output.close()
+    
+    try:
+        with rasterio.open(green_path) as green_src, \
+             rasterio.open(red_path) as red_src, \
+             rasterio.open(nir_path) as nir_src:
+            
+            profile = green_src.profile.copy()
+            profile.update({
+                'dtype': 'float32',
+                'count': 1,
+                'driver': 'GTiff',
+                'tiled': True,
+                'blockxsize': 256,
+                'blockysize': 256,
+                'compress': 'lzw'
+            })
+            
+            if 'nodata' in profile:
+                del profile['nodata']
+            
+            all_values = []
+            
+            for _, window in green_src.block_windows(1):
+                green_chunk = green_src.read(1, window=window).astype('float32')
+                red_chunk = red_src.read(1, window=window).astype('float32')
+                nir_chunk = nir_src.read(1, window=window).astype('float32')
+                
+                green_squared = green_chunk ** 2
+                mask = green_squared != 0
+                
+                if np.any(mask):
+                    cvi_chunk = np.zeros_like(green_chunk, dtype='float32')
+                    cvi_chunk[mask] = (nir_chunk[mask] * red_chunk[mask]) / green_squared[mask]
+                    
+                    valid_values = cvi_chunk[mask]
+                    all_values.extend(valid_values.flatten())
+            
+            #Вычисление диапазона для нормализации
+            if all_values:
+                cvi_min = np.percentile(all_values, 2)
+                cvi_max = np.percentile(all_values, 98)
+                diff = cvi_max - cvi_min
+            else:
+                cvi_min, cvi_max, diff = 0, 1, 1
+            
+            with rasterio.open(output_path, 'w', **profile) as dst:
+                for _, window in green_src.block_windows(1):
+                    green_chunk = green_src.read(1, window=window).astype('float32')
+                    red_chunk = red_src.read(1, window=window).astype('float32')
+                    nir_chunk = nir_src.read(1, window=window).astype('float32')
+                    
+                    green_squared = green_chunk ** 2
+                    mask = green_squared != 0
+                    
+                    cvi_chunk = np.zeros_like(green_chunk, dtype='float32')
+                    
+                    if np.any(mask):
+                        cvi_chunk[mask] = (nir_chunk[mask] * red_chunk[mask]) / green_squared[mask]
+                        
+                        #Нормализация
+                        if diff > 0:
+                            cvi_norm = (cvi_chunk[mask] - cvi_min) / diff
+                            cvi_chunk[mask] = np.clip(cvi_norm, 0, 1)
+                        else:
+                            cvi_chunk[mask] = 0
+                    
+                    dst.write(cvi_chunk, 1, window=window)
+            
+            return output_path
+            
+    except Exception as e:
+        if os.path.exists(output_path):
+            os.unlink(output_path)
+        raise
+
+def create_colored_geotiff_chunked(index_path: str, cmap_name: str, index_name: str) -> bytes:
+    """Создание цветного GeoTIFF по чанкам"""
     cmap = get_cmap(cmap_name)
     
-    if index_name == 'NDVI':
-        normalized_data = (data + 1) / 2
-    else:
-        normalized_data = np.clip(data, 0, 1)
-    
-    colored_data = cmap(normalized_data, bytes=True)[:, :, :3]
-    
-    profile = {
-        'driver': 'GTiff',
-        'dtype': 'uint8',
-        'count': 3,
-        'width': src_profile['width'],
-        'height': src_profile['height'],
-        'transform': transform,
-        'compress': 'lzw',
-        'tiled': True,
-        'blockxsize': 256,
-        'blockysize': 256,
-        'photometric': 'rgb'
-    }
-    
-    #Проверяем, что crs не None
-    if crs is not None:
-        try:
-            profile['crs'] = crs
-        except Exception as e:
-            logger.warning(f"Failed to set CRS: {str(e)}")
-    
-    with MemoryFile() as memfile:
-        with memfile.open(**profile) as dst:
-            for i in range(3):
-                dst.write(colored_data[:, :, i], i+1)
-            
-            dst.set_band_description(1, "Red channel")
-            dst.set_band_description(2, "Green channel")
-            dst.set_band_description(3, "Blue channel")
-            
-            dst.colorinterp = [ColorInterp.red, ColorInterp.green, ColorInterp.blue]
+    with rasterio.open(index_path) as src:
+        # Читаем профиль исходного файла
+        profile = src.profile.copy()
         
-        return memfile.read()
+        # Обновляем профиль для RGB файла (uint8 без nodata)
+        profile.update({
+            'dtype': 'uint8',
+            'count': 3,
+            'driver': 'GTiff',
+            'tiled': True,
+            'blockxsize': 256,
+            'blockysize': 256,
+            'compress': 'lzw',
+            'photometric': 'rgb'
+        })
+        
+        if 'nodata' in profile:
+            del profile['nodata']
+        
+        with MemoryFile() as memfile:
+            with memfile.open(**profile) as dst:
+                #Обрабатка по блокам
+                for _, window in src.block_windows(1):
+                    #Получаем индекс для текущего блока
+                    index_chunk = src.read(1, window=window)
+                    
+                    if index_name == 'NDVI':
+                        normalized_chunk = (index_chunk + 1) / 2
+                    else:
+                        normalized_chunk = np.clip(index_chunk, 0, 1)
+                    
+                    #Применение цветовой карты
+                    colored_chunk = cmap(normalized_chunk, bytes=True)[:, :, :3]
+
+                    for i in range(3):
+                        dst.write(colored_chunk[:, :, i], i + 1, window=window)
+                
+                dst.set_band_description(1, "Red channel")
+                dst.set_band_description(2, "Green channel")
+                dst.set_band_description(3, "Blue channel")
+                
+                dst.colorinterp = [ColorInterp.red, ColorInterp.green, ColorInterp.blue]
+            
+            return memfile.read()
+
+def cleanup_temp_files(*file_paths):
+    """Очистка временных файлов"""
+    for file_path in file_paths:
+        if file_path and os.path.exists(file_path):
+            try:
+                os.unlink(file_path)
+            except Exception as e:
+                logger.warning(f"Не удалось удалить временный файл {file_path}: {str(e)}")
+
 @app.post("/upload-raster-layer")
 async def upload_layer(file: UploadFile = File(...)):
     return {"message": "Layer uploaded successfully"}
 
 @app.post("/NDVI")
 async def calculate_ndvi(
-    red_file: UploadFile = File(..., max_size=200_000_000),
-    nir_file: UploadFile = File(..., max_size=200_000_000),
+    red_file: UploadFile = File(...),
+    nir_file: UploadFile = File(...),
     target_epsg: int = 4326
 ):
+    red_data = None
+    nir_data = None
+    ndvi_path = None
+    temp_files = []
+    
     try:
-        red_content, red_profile, red_shape = (await read_and_validate_files(red_file))[0]
-        nir_content, nir_profile, nir_shape = (await read_and_validate_files(nir_file))[0]
+        files_data = await read_and_validate_files(red_file, nir_file)
         
-        if red_shape != nir_shape:
+        red_data = files_data[0]
+        nir_data = files_data[1]
+        temp_files.extend([red_data['path'], nir_data['path']])
+        
+        if red_data['shape'] != nir_data['shape']:
             raise HTTPException(status_code=400, detail="Image dimensions mismatch")
-
+        
         target_crs = safe_crs_from_epsg(target_epsg)
         
-        with MemoryFile(red_content) as memfile_red, MemoryFile(nir_content) as memfile_nir:
-            with memfile_red.open() as red_src, memfile_nir.open() as nir_src:
-                red_crs = strict_crs_validation(red_src, target_epsg)
-                nir_crs = strict_crs_validation(nir_src, target_epsg)
-                
-                red = red_src.read(1).astype('float32')
-                nir = nir_src.read(1).astype('float32')
-
-                red, red_transform, _, _ = reproject_with_transform(red_src, red, target_crs)
-                nir, _, _, _ = reproject_with_transform(nir_src, nir, target_crs)
-
-                # Расчет NDVI с оптимизацией
-                denominator = nir + red
-                np.divide(nir - red, denominator, out=denominator, where=denominator!=0)
-                ndvi = np.clip(denominator, -1, 1)
-
-                # Создание результата
-                ndvi_bytes = create_colored_geotiff(
-                    ndvi, red_profile, target_crs, red_transform, 'NDVI', 'NDVI'
-                )
-
-                return StreamingResponse(
-                    io.BytesIO(ndvi_bytes),
-                    media_type="image/tiff",
-                    headers={
-                        "Content-Disposition": "attachment; filename=ndvi_colored.tif",
-                        "CRS-Info": str(target_crs.to_string()),
-                        "NDVI-Stats": f"min={np.nanmin(ndvi):.2f},max={np.nanmax(ndvi):.2f},mean={np.nanmean(ndvi):.2f}"
-                    }
-                )
-
+        #Вычисление NDVI по кускам
+        ndvi_path = calculate_ndvi_chunked(red_data['path'], nir_data['path'])
+        temp_files.append(ndvi_path)
+        
+        # Создаем цветное изображение
+        colored_bytes = create_colored_geotiff_chunked(ndvi_path, "NDVI", "NDVI")
+        
+        return StreamingResponse(
+            io.BytesIO(colored_bytes),
+            media_type="image/tiff",
+            headers={
+                "Content-Disposition": "attachment; filename=ndvi_colored.tif",
+                "CRS-Info": str(target_crs.to_string())
+            }
+        )
+        
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"NDVI calculation error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    finally:
+        #Очищаем временные файлы
+        cleanup_temp_files(*temp_files)
 
 @app.post("/EVI")
 async def calculate_evi(
-    blue_file: UploadFile = File(..., max_size=200_000_000),
-    red_file: UploadFile = File(..., max_size=200_000_000),
-    nir_file: UploadFile = File(..., max_size=200_000_000),
+    blue_file: UploadFile = File(...),
+    red_file: UploadFile = File(...),
+    nir_file: UploadFile = File(...),
     target_epsg: int = 4326,
-    L: float = 1.0,
-    C1: float = 6.0,
-    C2: float = 7.5,
-    G: float = 2.5
+    L: float = 1.0, C1: float = 6.0, C2: float = 7.5, G: float = 2.5
 ):
-    """Расчет EVI (Enhanced Vegetation Index)"""
+    blue_data = None
+    red_data = None
+    nir_data = None
+    evi_path = None
+    temp_files = []
+    
     try:
-        # Чтение и проверка файлов
-        blue_content, blue_profile, blue_shape = (await read_and_validate_files(blue_file))[0]
-        red_content, red_profile, red_shape = (await read_and_validate_files(red_file))[0]
-        nir_content, nir_profile, nir_shape = (await read_and_validate_files(nir_file))[0]
+        files_data = await read_and_validate_files(blue_file, red_file, nir_file)
         
-        if not (blue_shape == red_shape == nir_shape):
-            raise HTTPException(status_code=400, detail="Размеры изображений не совпадают")
+        blue_data = files_data[0]
+        red_data = files_data[1]
+        nir_data = files_data[2]
+        temp_files.extend([blue_data['path'], red_data['path'], nir_data['path']])
 
+        if not (blue_data['shape'] == red_data['shape'] == nir_data['shape']):
+            raise HTTPException(status_code=400, detail="Размеры изображений не совпадают")
+        
         target_crs = safe_crs_from_epsg(target_epsg)
         
-        with MemoryFile(blue_content) as memfile_blue, \
-             MemoryFile(red_content) as memfile_red, \
-             MemoryFile(nir_content) as memfile_nir:
-            
-            with memfile_blue.open() as blue_src, \
-                 memfile_red.open() as red_src, \
-                 memfile_nir.open() as nir_src:
-                
-                strict_crs_validation  (blue_src, target_epsg)
-                strict_crs_validation  (red_src, target_epsg)
-                strict_crs_validation  (nir_src, target_epsg)
-                
-                blue = blue_src.read(1).astype('float32')
-                red = red_src.read(1).astype('float32')
-                nir = nir_src.read(1).astype('float32')
-
-                blue, blue_transform, _, _ = reproject_with_transform(blue_src, blue, target_crs)
-                red, _, _, _ = reproject_with_transform(red_src, red, target_crs)
-                nir, _, _, _ = reproject_with_transform(nir_src, nir, target_crs)
-
-                # Расчет EVI
-                numerator = nir - red
-                denominator = nir + C1 * red - C2 * blue + L
-                denominator[denominator == 0] = np.nan
-                evi = G * (numerator / denominator)
-                evi = np.clip(evi, 0, 1)  # EVI обычно в диапазоне 0-1
-
-                # Создание результата
-                output_bytes = create_colored_geotiff(
-                    evi, blue_src.profile, target_crs, blue_transform, 'EVI', 'EVI'
-                )
-
-                return StreamingResponse(
-                    io.BytesIO(output_bytes),
-                    media_type="image/tiff",
-                    headers={
-                        "Content-Disposition": "attachment; filename=evi_colored.tif",
-                        "CRS-Info": str(target_crs.to_string()),
-                        "EVI-Stats": f"min={np.nanmin(evi):.2f},max={np.nanmax(evi):.2f},mean={np.nanmean(evi):.2f}"
-                    }
-                )
-
+        #Вычисляем EVI по кускам
+        evi_path = calculate_evi_chunked(
+            blue_data['path'], red_data['path'], nir_data['path'], 
+            L, C1, C2, G
+        )
+        temp_files.append(evi_path)
+        
+        colored_bytes = create_colored_geotiff_chunked(evi_path, "EVI", "EVI")
+        
+        return StreamingResponse(
+            io.BytesIO(colored_bytes),
+            media_type="image/tiff",
+            headers={
+                "Content-Disposition": "attachment; filename=evi_colored.tif",
+                "CRS-Info": str(target_crs.to_string())
+            }
+        )
+        
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"EVI calculation error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    finally:
+        cleanup_temp_files(*temp_files)
 
 @app.post("/CVI")
 async def calculate_cvi(
-    green_file: UploadFile = File(..., max_size=200_000_000),
-    red_file: UploadFile = File(..., max_size=200_000_000),
-    nir_file: UploadFile = File(..., max_size=200_000_000),
+    green_file: UploadFile = File(...),
+    red_file: UploadFile = File(...),
+    nir_file: UploadFile = File(...),
     target_epsg: int = 4326
 ):
-    """Расчет CVI (Chlorophyll Vegetation Index)"""
+    green_data = None
+    red_data = None
+    nir_data = None
+    cvi_path = None
+    temp_files = []
+    
     try:
-        green_content, green_profile, green_shape = (await read_and_validate_files(green_file))[0]
-        red_content, red_profile, red_shape = (await read_and_validate_files(red_file))[0]
-        nir_content, nir_profile, nir_shape = (await read_and_validate_files(nir_file))[0]
+        files_data = await read_and_validate_files(green_file, red_file, nir_file)
         
-        if not (green_shape == red_shape == nir_shape):
+        green_data = files_data[0]
+        red_data = files_data[1]
+        nir_data = files_data[2]
+        temp_files.extend([green_data['path'], red_data['path'], nir_data['path']])
+        
+        if not (green_data['shape'] == red_data['shape'] == nir_data['shape']):
             raise HTTPException(status_code=400, detail="Размеры изображений не совпадают")
-
+        
         target_crs = safe_crs_from_epsg(target_epsg)
         
-        with MemoryFile(green_content) as memfile_green, \
-             MemoryFile(red_content) as memfile_red, \
-             MemoryFile(nir_content) as memfile_nir:
-            
-            with memfile_green.open() as green_src, \
-                 memfile_red.open() as red_src, \
-                 memfile_nir.open() as nir_src:
-                
-                strict_crs_validation(green_src, target_epsg)
-                strict_crs_validation(red_src, target_epsg)
-                strict_crs_validation(nir_src, target_epsg)
-                
-                green = green_src.read(1).astype('float32')
-                red = red_src.read(1).astype('float32')
-                nir = nir_src.read(1).astype('float32')
-
-                green, green_transform, _, _ = reproject_with_transform(green_src, green, target_crs)
-                red, _, _, _ = reproject_with_transform(red_src, red, target_crs)
-                nir, _, _, _ = reproject_with_transform(nir_src, nir, target_crs)
-
-                green_squared = green ** 2
-                # Заменяем нули на NaN, чтобы избежать деления на ноль
-                green_squared[green_squared == 0] = np.nan
-                
-                # Вычисляем CVI, игнорируя деление на ноль
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    cvi = (nir * red) / green_squared
-                
-                cvi = np.nan_to_num(cvi, nan=0.0, posinf=0.0, neginf=0.0)
-                
-                # Автоматическое определение диапазона
-                valid_values = cvi[np.isfinite(cvi)]
-                if len(valid_values) > 0:
-                    cvi_min = np.percentile(valid_values, 2)  # 2-й перцентиль
-                    cvi_max = np.percentile(valid_values, 98) # 98-й перцентиль
-                else:
-                    cvi_min, cvi_max = 0.0, 1.0
-                
-                # Нормализация к 0-1 с обрезкой выбросов
-                range_diff = cvi_max - cvi_min
-                if range_diff > 0:
-                    cvi_normalized = (cvi - cvi_min) / range_diff
-                else:
-                    cvi_normalized = np.zeros_like(cvi)
-                cvi_normalized = np.clip(cvi_normalized, 0, 1)
-
-                output_bytes = create_colored_geotiff(
-                    cvi_normalized,
-                    green_src.profile,
-                    target_crs,
-                    green_transform,
-                    'CVI',
-                    'CVI'
-                )
-
-                return StreamingResponse(
-                    io.BytesIO(output_bytes),
-                    media_type="image/tiff",
-                    headers={
-                        "Content-Disposition": "attachment; filename=cvi_colored.tif",
-                        "CRS-Info": str(target_crs.to_string()),
-                        "CVI-Stats": f"min={np.nanmin(cvi):.2f},max={np.nanmax(cvi):.2f},mean={np.nanmean(cvi):.2f}",
-                        "CVI-Range": f"normalized_range={cvi_min:.2f}-{cvi_max:.2f}"
-                    }
-                )
-
+        #Вычисляем CVI по кускам
+        cvi_path = calculate_cvi_chunked(green_data['path'], red_data['path'], nir_data['path'])
+        temp_files.append(cvi_path)
+        
+        colored_bytes = create_colored_geotiff_chunked(cvi_path, "CVI", "CVI")
+        
+        return StreamingResponse(
+            io.BytesIO(colored_bytes),
+            media_type="image/tiff",
+            headers={
+                "Content-Disposition": "attachment; filename=cvi_colored.tif",
+                "CRS-Info": str(target_crs.to_string())
+            }
+        )
+        
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"CVI calculation error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
-    
-async def shutdown_event():
-    print("Shutting down...")
-
-app.add_event_handler("shutdown", shutdown_event)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    finally:
+        cleanup_temp_files(*temp_files)
 
 if __name__ == "__main__":
     config = uvicorn.Config(
@@ -403,7 +572,6 @@ if __name__ == "__main__":
         port=8000,
         reload=True,
         log_level="debug",
-        # Добавляем graceful shutdown
         timeout_graceful_shutdown=10.0,
     )
     server = uvicorn.Server(config)
